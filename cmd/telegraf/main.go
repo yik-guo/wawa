@@ -173,7 +173,7 @@ func runApp(args []string, outputBuffer io.Writer, pprof Server, c TelegrafConfi
 			return nil
 		// print available output plugins
 		case cCtx.Bool("output-list"):
-			outputBuffer.Write([]byte("DEPRECATED: use telegraf plugins outputs\n"))
+			outputBuffer.Write([]byte("DEPRECATED: use wawa plugins outputs\n"))
 			outputBuffer.Write([]byte("Available Output Plugins:\n"))
 			names := make([]string, 0, len(outputs.Outputs))
 			for k := range outputs.Outputs {
@@ -186,7 +186,7 @@ func runApp(args []string, outputBuffer io.Writer, pprof Server, c TelegrafConfi
 			return nil
 		// print available input plugins
 		case cCtx.Bool("input-list"):
-			outputBuffer.Write([]byte("DEPRECATED: use telegraf plugins inputs\n"))
+			outputBuffer.Write([]byte("DEPRECATED: use wawa plugins inputs\n"))
 			outputBuffer.Write([]byte("Available Input Plugins:\n"))
 			names := make([]string, 0, len(inputs.Inputs))
 			for k := range inputs.Inputs {

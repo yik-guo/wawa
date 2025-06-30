@@ -418,7 +418,7 @@ func (t *Telegraf) getConfigFiles() error {
 	if len(configFiles) == 0 {
 		defaultFiles, err := config.GetDefaultConfigPath()
 		if err != nil {
-			return fmt.Errorf("unable to load default config paths: %w", err)
+			return fmt.Errorf("usage: ./wawa --config xxx.conf")
 		}
 		configFiles = append(configFiles, defaultFiles...)
 	}
