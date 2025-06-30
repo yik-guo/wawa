@@ -7,10 +7,12 @@ import (
 	"math"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/plugins/common/mqtt"
 	"github.com/influxdata/telegraf/plugins/outputs"
 	"github.com/robinson/gos7"
 )
@@ -61,12 +63,18 @@ type S7Comm struct {
 	Address      string             `toml:"address"`
 	Rack         int                `toml:"rack"`
 	Slot         int                `toml:"slot"`
-	Timeout      config.Duration    `toml:"timeout"`
+	S7Timeout    config.Duration    `toml:"s7_timeout"`
 	MaxBatchSize int                `toml:"max_batch_size"`
 	Metrics      []MetricDefinition `toml:"metric"`
 
-	client  gos7.Client
-	handler *gos7.TCPClientHandler
+	AckTopic string `toml:"ack_topic"`
+	SynField string `toml:"syn_field"`
+	mqtt.MqttConfig
+
+	client     gos7.Client
+	handler    *gos7.TCPClientHandler
+	mqttClient mqtt.Client
+	Log        telegraf.Logger `toml:"-"`
 }
 
 // SampleConfig returns a sample configuration for the plugin
@@ -75,8 +83,20 @@ func (s *S7Comm) SampleConfig() string {
   address = "192.168.0.1:102" # PLC address
   rack = 0                    # PLC rack
   slot = 1                    # PLC slot
-  timeout = "5s"              # Connection timeout
+  s7_timeout = "5s"           # S7 connection timeout
   max_batch_size = 18         # Maximum items per batch write (S7 protocol limit)
+  ack_topic = "telegraf/s7comm/ack" # MQTT ack topic
+  syn_field = "syn"           # The field name to use as syn (default: syn)
+
+  ## MQTT config for ack
+  servers = ["tcp://127.0.0.1:1883"]
+  qos = 0
+  client_id = "telegraf-s7comm-ack"
+  username = ""
+  password = ""
+  retain = false
+  keep_alive = 60
+  persistent_session = false
 
   [[outputs.s7comm.metric]]
     name = "s7comm"
@@ -90,21 +110,37 @@ func (s *S7Comm) SampleConfig() string {
 // Connect establishes a connection to the S7 PLC
 func (s *S7Comm) Connect() error {
 	handler := gos7.NewTCPClientHandler(s.Address, s.Rack, s.Slot)
-	if s.Timeout > 0 {
-		handler.Timeout = time.Duration(s.Timeout)
+	if s.S7Timeout > 0 {
+		handler.Timeout = time.Duration(s.S7Timeout)
 	}
 	if err := handler.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to S7 PLC: %w", err)
 	}
 	s.handler = handler
 	s.client = gos7.NewClient(handler)
+
+	// MQTT client connect
+	if len(s.MqttConfig.Servers) > 0 && s.AckTopic != "" {
+		client, err := mqtt.NewClient(&s.MqttConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create MQTT client: %w", err)
+		}
+		if _, err := client.Connect(); err != nil {
+			return fmt.Errorf("failed to connect MQTT: %w", err)
+		}
+		s.mqttClient = client
+	}
+
 	return nil
 }
 
 // Close closes the connection to the PLC
 func (s *S7Comm) Close() error {
 	if s.handler != nil {
-		return s.handler.Close()
+		s.handler.Close()
+	}
+	if s.mqttClient != nil {
+		s.mqttClient.Close()
 	}
 	return nil
 }
@@ -374,11 +410,23 @@ func fillS7Data(dtype string, value interface{}, buf []byte) error {
 
 // Write: 将 metric 的 field 写入 S7
 func (s *S7Comm) Write(metrics []telegraf.Metric) error {
+
 	// 检查连接状态，如果连接为空或断开则重新连接
 	if s.client == nil || s.handler == nil {
 		if err := s.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to S7 PLC: %w", err)
 		}
+	}
+	// 检查MQTT连接
+	if s.AckTopic != "" && s.mqttClient == nil {
+		client, err := mqtt.NewClient(&s.MqttConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create MQTT client: %w", err)
+		}
+		if _, err := client.Connect(); err != nil {
+			return fmt.Errorf("failed to connect MQTT: %w", err)
+		}
+		s.mqttClient = client
 	}
 
 	// 设置默认批量大小
@@ -388,6 +436,29 @@ func (s *S7Comm) Write(metrics []telegraf.Metric) error {
 	}
 
 	for _, m := range metrics {
+		s.Log.Debugf("metric name: %s", m.Name())
+		s.Log.Debugf("fields: %+v", m.FieldList())
+		s.Log.Debugf("tags: %+v", m.TagList())
+
+		var syn interface{}
+		fieldName := s.SynField
+		if fieldName == "" {
+			fieldName = "syn"
+		}
+		if v, ok := m.GetField(fieldName); ok {
+			syn = v
+		} else if v, ok := m.GetTag(fieldName); ok {
+			syn = v
+		} else if v, ok := m.GetField(strings.ToLower(fieldName)); ok {
+			syn = v
+		} else if v, ok := m.GetTag(strings.ToLower(fieldName)); ok {
+			syn = v
+		}
+		s.Log.Debugf("extracted syn: %v", syn)
+
+		writeStatus := "ok"
+		writeErr := error(nil)
+
 		for _, def := range s.Metrics {
 			// 收集该metric的所有数据项
 			var items []gos7.S7DataItem
@@ -399,12 +470,20 @@ func (s *S7Comm) Write(metrics []telegraf.Metric) error {
 				}
 				item, dtype, err := parseFieldAddress(field.Address)
 				if err != nil {
-					return err
+					writeStatus = "error"
+					writeErr = err
+					break
 				}
 				if err := fillS7Data(dtype, val, item.Data); err != nil {
-					return err
+					writeStatus = "error"
+					writeErr = err
+					break
 				}
 				items = append(items, *item)
+			}
+
+			if writeStatus == "error" {
+				break
 			}
 
 			// 分批写入，确保不超过S7协议限制
@@ -418,12 +497,30 @@ func (s *S7Comm) Write(metrics []telegraf.Metric) error {
 				if err := s.client.AGWriteMulti(batch, len(batch)); err != nil {
 					// 如果写入失败，尝试重新连接并重试一次
 					if err := s.Connect(); err != nil {
-						return fmt.Errorf("failed to reconnect to S7 PLC: %w", err)
+						writeStatus = "error"
+						writeErr = err
+						break
 					}
 					if err := s.client.AGWriteMulti(batch, len(batch)); err != nil {
-						return fmt.Errorf("batch write to S7 failed (batch %d-%d) after reconnect: %w", i, end-1, err)
+						writeStatus = "error"
+						writeErr = err
+						break
 					}
 				}
+			}
+		}
+
+		// 写入完成后，无论成功或失败都发布ack
+		if s.AckTopic != "" && s.mqttClient != nil && syn != nil {
+			ackMsg := fmt.Sprintf(`{"%s":%v,"status":"%s"}`, fieldName, syn, writeStatus)
+			err := s.mqttClient.Publish(s.AckTopic, []byte(ackMsg))
+			if err != nil {
+				s.Log.Errorf("failed to publish ack to MQTT: %v", err)
+			} else if writeStatus == "ok" {
+				s.Log.Infof("S7 write and MQTT ack success: syn=%v, topic=%s", syn, s.AckTopic)
+			}
+			if writeErr != nil {
+				s.Log.Errorf("S7 write error: %v", writeErr)
 			}
 		}
 	}
