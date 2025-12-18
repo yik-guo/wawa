@@ -228,10 +228,13 @@ func parseFieldAddress(address string) (*gos7.S7DataItem, string, error) {
 		Area:     area,
 		WordLen:  wordlen,
 		Bit:      bit,
-		DBNumber: areaidx,
+		DBNumber: 0, // 默认0，只有DB区才赋值
 		Start:    start,
 		Amount:   amount,
 		Data:     make([]byte, buflen),
+	}
+	if groups["area"] == "DB" {
+		item.DBNumber = areaidx
 	}
 	return item, dtype, nil
 }
@@ -473,6 +476,59 @@ func (s *S7Comm) Write(metrics []telegraf.Metric) error {
 					writeStatus = "error"
 					writeErr = err
 					break
+				}
+				if dtype == "X" {
+					// 读-改-写流程
+					// 1. 先读出目标字节
+					readItem := *item
+					readItem.WordLen = wordLenMap["B"] // 读字节
+					readItem.Bit = 0
+					readItem.Amount = 1
+					readItem.Data = make([]byte, 1)
+					err := s.client.AGReadMulti([]gos7.S7DataItem{readItem}, 1)
+					if err != nil {
+						// 尝试重连
+						if connErr := s.Connect(); connErr == nil {
+							err = s.client.AGReadMulti([]gos7.S7DataItem{readItem}, 1)
+						}
+						if err != nil {
+							writeStatus = "error"
+							writeErr = fmt.Errorf("read before bit write failed: %w", err)
+							s.Log.Errorf("Bit write failed (read): field=%s, address=%s, error=%v", field.Name, field.Address, writeErr)
+							break
+						}
+					}
+					// 2. 修改目标 bit
+					b := false
+					switch v := val.(type) {
+					case bool:
+						b = v
+					case int:
+						b = v != 0
+					case int64:
+						b = v != 0
+					case float64:
+						b = v != 0
+					}
+					if b {
+						readItem.Data[0] |= (1 << item.Bit)
+					} else {
+						readItem.Data[0] &^= (1 << item.Bit)
+					}
+					// 3. 写回整个字节
+					writeItem := readItem
+					writeItem.WordLen = wordLenMap["B"] // 写字节
+					writeItem.Bit = 0
+					writeItem.Amount = 1
+					if err := s.client.AGWriteMulti([]gos7.S7DataItem{writeItem}, 1); err != nil {
+						writeStatus = "error"
+						writeErr = fmt.Errorf("bit write failed: %w", err)
+						s.Log.Errorf("Bit write failed: field=%s, address=%s, error=%v", field.Name, field.Address, writeErr)
+						break
+					} else {
+						s.Log.Infof("Bit write success: field=%s, address=%s, value=%v", field.Name, field.Address, val)
+					}
+					continue // bit 类型已写，跳过后续逻辑
 				}
 				if err := fillS7Data(dtype, val, item.Data); err != nil {
 					writeStatus = "error"
